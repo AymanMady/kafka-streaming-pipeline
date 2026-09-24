@@ -1,0 +1,36 @@
+# ---------- Secrets / local environment ----------
+.env
+
+# ---------- Data generated at run time ----------
+# Kafka segments (the broker recreates them at startup)
+data/kafka/
+# State of the Spark streaming queries (offsets + metadata)
+data/checkpoints/
+# Job outputs (parquet, csv, json)
+data/output/
+!data/**/.gitkeep
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- Spark ----------
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+_SUCCESS
+
+# ---------- Misc ----------
+.DS_Store
+*.log
+.idea/
+.vscode/
+LEARNING.md

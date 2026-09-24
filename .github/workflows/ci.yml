@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint the Python code
+        run: ruff check .
+
+      - name: Check the shell scripts parse
+        run: |
+          find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+  compose:
+    name: Validate the Docker stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `docker compose config` resolves every variable, image and volume.
+      # A typo in the stack fails here instead of at `make up` time.
+      - name: Validate docker-compose.yml
+        run: docker compose --env-file .env.example config --quiet
+
+  pipeline:
+    name: Produce and consume against a real broker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # A real single-node KRaft broker, reachable on localhost:9092 exactly
+      # as it is locally. The producer and consumer run unmodified against it.
+      - name: Start a Kafka broker
+        run: |
+          docker run -d --name kafka -p 9092:9092 \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            apache/kafka:3.9.1
+          for i in $(seq 1 30); do
+            docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
+              --bootstrap-server localhost:9092 >/dev/null 2>&1 && break
+            sleep 5
+          done
+
+      - name: Create the topic
+        run: |
+          docker exec kafka /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create --topic orders --partitions 4 --replication-factor 1
+
+      # Fails the build if a single message is not acknowledged by the broker.
+      - name: Produce 200 orders
+        run: python src/producer/order_producer.py --rate 0 --count 200 --quiet
+
+      - name: Consume them back
+        run: |
+          timeout 90 python src/consumer/order_consumer.py \
+            --from-beginning --max-messages 200 --quiet --group ci-check
+
+      # The key -> partition mapping is computed, then compared with what the
+      # broker actually did. A non-zero exit means they diverged.
+      - name: Verify the key -> partition mapping
+        run: python scripts/demo_partitioning.py
+
+  streaming:
+    name: Spark Structured Streaming (phases 8-19)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A dedicated network so the Spark container reaches Kafka and
+      # PostgreSQL by name, exactly as docker-compose does locally.
+      - name: Start Kafka and PostgreSQL
+        run: |
+          docker network create ksp-ci
+          docker run -d --name kafka --network ksp-ci -p 9092:9092 \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093 \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092 \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_AUTO_CREATE_TOPICS_ENABLE=false \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            apache/kafka:3.9.1
+          docker run -d --name postgres --network ksp-ci \
+            -e POSTGRES_USER=stream_user \
+            -e POSTGRES_PASSWORD=ci_password \
+            -e POSTGRES_DB=streaming_analytics \
+            postgres:16-alpine
+          for i in $(seq 1 30); do
+            docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
+              --bootstrap-server kafka:9092 >/dev/null 2>&1 && break
+            sleep 5
+          done
+          for i in $(seq 1 30); do
+            docker exec postgres pg_isready -U stream_user -d streaming_analytics && break
+            sleep 2
+          done
+
+      - name: Create the topics
+        run: |
+          for t in "orders 4" "orders-invalid 1"; do
+            set -- $t
+            docker exec kafka /opt/kafka/bin/kafka-topics.sh \
+              --bootstrap-server kafka:9092 \
+              --create --topic "$1" --partitions "$2" --replication-factor 1
+          done
+
+      # The same image the project runs locally: Spark 3.5.6 with the Kafka
+      # connector baked in. HOST_UID must match the runner's user, otherwise
+      # the container cannot write the checkpoints into the workspace.
+      - name: Build the Spark image
+        run: |
+          docker build -f docker/spark/Dockerfile -t ksp-spark:3.5.6 \
+            --build-arg HOST_UID=$(id -u) --build-arg HOST_GID=$(id -g) .
+
+      - name: Apply the schema migration
+        run: |
+          docker exec -i postgres psql -q -v ON_ERROR_STOP=1 \
+            -U stream_user -d streaming_analytics -f - < sql/01_streaming_tables.sql
+
+      # 52 tests on a local[2] SparkSession: neither Kafka nor a cluster is
+      # needed, so they stay fast.
+      - name: Unit tests
+        run: |
+          docker run --rm -v "$PWD":/opt/workspace -w /opt/workspace \
+            ksp-spark:3.5.6 python3 -m pytest tests/ -q
+
+      # Deliberately dirty: 15% invalid events, so the DLQ has something to
+      # catch and the run proves the rules actually fire.
+      - name: Produce 1000 events, 15% of them invalid
+        run: |
+          docker run --rm --network ksp-ci -v "$PWD":/opt/workspace -w /opt/workspace \
+            -e KAFKA_BOOTSTRAP=kafka:9092 ksp-spark:3.5.6 \
+            python3 src/producer/order_producer.py \
+              --rate 0 --count 1000 --invalid-rate 0.15 --seed 42 --quiet
+
+      - name: Phase 10 - validate the stream and fill the DLQ
+        run: |
+          docker run --rm --network ksp-ci -v "$PWD":/opt/workspace -w /opt/workspace \
+            -e KAFKA_BOOTSTRAP=kafka:9092 ksp-spark:3.5.6 \
+            spark-submit --master "local[2]" src/streaming/validate_stream.py \
+              --from-beginning --duration 60 --checkpoint /tmp/ci/validate
+
+      - name: The DLQ must not be empty
+        run: |
+          END=$(docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh \
+            --bootstrap-server kafka:9092 --topic orders-invalid | cut -d: -f3)
+          echo "orders-invalid holds $END message(s)"
+          test "$END" -gt 0
+
+      - name: Phases 11-17 - windows, watermarks, PostgreSQL
+        run: |
+          docker run --rm --network ksp-ci -v "$PWD":/opt/workspace -w /opt/workspace \
+            -e KAFKA_BOOTSTRAP=kafka:9092 \
+            -e PGHOST_OVERRIDE=postgres -e PGPORT_OVERRIDE=5432 \
+            -e POSTGRES_PASSWORD=ci_password \
+            ksp-spark:3.5.6 \
+            spark-submit --master "local[2]" src/streaming/analytics_stream.py \
+              --sink postgres --from-beginning --window "1 minute" \
+              --watermark "2 minutes" --duration 60 \
+              --checkpoint-prefix ci-run-1
+
+      - name: Capture the totals
+        run: |
+          docker exec postgres psql -U stream_user -d streaming_analytics -t -A -F, -c \
+            "SELECT count(*), coalesce(sum(orders_count),0), coalesce(round(sum(total_amount),2),0)
+             FROM analytics.revenue_by_country_window;" > /tmp/totals-1.csv
+          cat /tmp/totals-1.csv
+          test -s /tmp/totals-1.csv
+          test "$(cut -d, -f2 /tmp/totals-1.csv)" -gt 0
+
+      # PHASE 16. Replaying the whole topic with a fresh checkpoint re-emits
+      # every window. With a plain INSERT the revenue would double. The upsert
+      # is what turns at-least-once delivery into an exactly-once RESULT.
+      - name: Phase 16 - replay everything, the totals must not move
+        run: |
+          docker run --rm --network ksp-ci -v "$PWD":/opt/workspace -w /opt/workspace \
+            -e KAFKA_BOOTSTRAP=kafka:9092 \
+            -e PGHOST_OVERRIDE=postgres -e PGPORT_OVERRIDE=5432 \
+            -e POSTGRES_PASSWORD=ci_password \
+            ksp-spark:3.5.6 \
+            spark-submit --master "local[2]" src/streaming/analytics_stream.py \
+              --sink postgres --from-beginning --window "1 minute" \
+              --watermark "2 minutes" --duration 60 \
+              --checkpoint-prefix ci-run-2
+          docker exec postgres psql -U stream_user -d streaming_analytics -t -A -F, -c \
+            "SELECT count(*), coalesce(sum(orders_count),0), coalesce(round(sum(total_amount),2),0)
+             FROM analytics.revenue_by_country_window;" > /tmp/totals-2.csv
+          echo "before: $(cat /tmp/totals-1.csv)"
+          echo "after : $(cat /tmp/totals-2.csv)"
+          diff /tmp/totals-1.csv /tmp/totals-2.csv
+
+      # PHASE 16, the consumer side: raw.orders is keyed on event_id, so
+      # re-reading the same messages inserts nothing.
+      - name: Phase 16 - the consumer sink is idempotent too
+        run: |
+          run_consumer() {
+            docker run --rm --network ksp-ci -v "$PWD":/opt/workspace -w /opt/workspace \
+              -e KAFKA_BOOTSTRAP=kafka:9092 \
+              -e PGHOST_OVERRIDE=postgres -e PGPORT_OVERRIDE=5432 \
+              -e POSTGRES_PASSWORD=ci_password ksp-spark:3.5.6 \
+              python3 src/consumer/order_consumer.py \
+                --from-beginning --max-messages 500 --sink postgres --quiet --group "$1"
+          }
+          run_consumer ci-first
+          BEFORE=$(docker exec postgres psql -U stream_user -d streaming_analytics -t -A -c \
+            "SELECT count(*) FROM raw.orders;")
+          run_consumer ci-replay
+          AFTER=$(docker exec postgres psql -U stream_user -d streaming_analytics -t -A -c \
+            "SELECT count(*) FROM raw.orders;")
+          echo "raw.orders: $BEFORE -> $AFTER"
+          test "$BEFORE" -gt 0
+          test "$BEFORE" = "$AFTER"
+
+      - name: Phase 17 - the query metrics were persisted
+        run: |
+          docker exec postgres psql -U stream_user -d streaming_analytics -c \
+            "SELECT query_name, count(*) AS batches, max(input_rows) AS max_input
+             FROM analytics.stream_metrics GROUP BY query_name;"
+          COUNT=$(docker exec postgres psql -U stream_user -d streaming_analytics -t -A -c \
+            "SELECT count(*) FROM analytics.stream_metrics;")
+          test "$COUNT" -gt 0

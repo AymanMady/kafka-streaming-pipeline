@@ -1,0 +1,274 @@
+# =============================================================================
+#  Kafka Streaming Pipeline - local environment
+#
+#    kafka      : THE BROKER. It stores the events and serves them to consumers.
+#                 KRaft mode: Kafka handles its own consensus (no ZooKeeper).
+#    kafka-ui   : web interface to SEE topics / partitions / offsets / lag.
+#    postgres   : analytics database, final destination of the Spark aggregates.
+#
+#  Spark (master + worker) arrives in PHASE 8, when it is actually needed.
+#
+#  Start: docker compose up -d      Stop: docker compose down
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # KAFKA (single broker, KRaft mode)
+  #
+  #  Why KRaft?
+  #  Historically Kafka needed ZooKeeper to know WHO the cluster controller is,
+  #  WHICH partitions exist, WHO is leader. Since Kafka 3.3 (KRaft = Kafka
+  #  Raft), the broker keeps that registry itself in a replicated internal topic
+  #  (__cluster_metadata). The result: one fewer service to deploy, to monitor,
+  #  and to have fail on you.
+  #
+  #  process.roles = broker,controller -> this container plays BOTH roles.
+  #  That is "combined" mode, perfect locally, discouraged in production (where
+  #  controllers are separated from brokers).
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: ksp-kafka
+    hostname: kafka
+    # The image already runs as uid 1000: we state it so the segments written
+    # into data/kafka belong to you on the host (and stay readable).
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    ports:
+      # EXTERNAL listener: for clients started from YOUR machine.
+      - "${KAFKA_HOST_PORT:-9092}:19092"
+    environment:
+      # ---- Identity of the node inside the KRaft quorum ----
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-55bSTJM8SVWp9FTl0cBMPw}
+      # The controller quorum: a single node here, "1@kafka:9093"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # ---- Listeners: THE detail that breaks 80% of Kafka-on-Docker setups ----
+      #  A client never talks straight to the address it dialled: it first asks
+      #  the broker "give me your addresses" (metadata), then RECONNECTS to the
+      #  ADVERTISED address. If the broker advertises an address the client
+      #  cannot resolve, everything breaks.
+      #  -> from another container, "kafka:9092" resolves (docker DNS)
+      #  -> from your machine, only "localhost:9092" does
+      #  Hence TWO distinct listeners, on two different ports.
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # ---- Replication: a single broker locally, so a single copy ----
+      #  In production these values are 3: if a broker dies, the data survives.
+      #  Here, a broker dying = data unavailable. A deliberate trade-off for a
+      #  learning environment.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      # ---- Broker behaviour ----
+      # Automatic topic creation is FORBIDDEN: we want to choose the partition
+      # count explicitly (phase 2). Otherwise a typo in a topic name silently
+      # creates a ghost topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 4
+      # Delay before rebalancing when a consumer joins a group.
+      # 0 = immediate reaction (convenient for the phase 6 demos).
+      # Kafka default = 3000 ms, to avoid N rebalances at startup.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # RETENTION: how long Kafka keeps a message AFTER it has been read.
+      # Kafka is not a queue that deletes on consumption: it is a LOG.
+      # The message stays 7 days -> history can be replayed.
+      KAFKA_LOG_RETENTION_HOURS: ${KAFKA_RETENTION_HOURS:-168}
+      # Where Kafka writes its segments on disk (bind-mounted into data/kafka)
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP:--Xmx768m -Xms768m}
+    volumes:
+      # A DELIBERATE bind mount (not a named volume): you can open
+      # data/kafka/orders-0/ and see the .log/.index files of a partition with
+      # your own eyes. It is the best way to understand what a partitioned
+      # topic physically is.
+      - ./data/kafka:/var/lib/kafka/data
+    healthcheck:
+      # We do not probe the port (it listens before being ready): we ask the
+      # broker for its API list. If it answers, it is genuinely usable.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks: [ksp-net]
+
+  # ---------------------------------------------------------------------------
+  # KAFKA UI
+  # Kafka ships no native interface. This UI reads the cluster metadata and
+  # displays topics, partitions, offsets (start/end), consumer groups and above
+  # all the CONSUMER LAG (phase 17). Pure observability: removing it breaks
+  # nothing.
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    container_name: ksp-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_UI_PORT:-8085}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: ksp-local
+      # INTERNAL address: the UI is a container, it goes through the docker network
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+      JAVA_OPTS: -Xmx320m -Xms320m
+    networks: [ksp-net]
+
+  # ---------------------------------------------------------------------------
+  # POSTGRESQL
+  # The analytics destination: this is where Spark will write the windowed
+  # aggregates (phase 15) and the Python consumer the raw orders.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ksp-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-stream_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_local_env}
+      POSTGRES_DB: ${POSTGRES_DB:-streaming_analytics}
+    ports:
+      # 5432 / 5433 / 5434 / 5440 are already taken by the other projects -> 5441
+      - "${POSTGRES_HOST_PORT:-5441}:5432"
+    volumes:
+      - ksp-pgdata:/var/lib/postgresql/data
+      # WARNING: this script only runs WHEN THE VOLUME IS CREATED.
+      # Any schema change goes through sql/ + "make db-migrate".
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stream_user} -d ${POSTGRES_DB:-streaming_analytics}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [ksp-net]
+
+  # ---------------------------------------------------------------------------
+  # SPARK MASTER (phase 8)
+  #
+  # It runs NO computation. It keeps the registry of the workers and allocates
+  # cores and RAM to the applications that connect.
+  #
+  # One single image for the three roles (master, worker, driver): the driver
+  # and the executors MUST run the same Spark and Python version, otherwise
+  # Spark refuses to start ("Python in worker has different version").
+  # ---------------------------------------------------------------------------
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+      args:
+        HOST_UID: ${HOST_UID:-1000}
+        HOST_GID: ${HOST_GID:-1000}
+    image: ksp-spark:3.5.6
+    container_name: ksp-spark-master
+    hostname: spark-master
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "${SPARK_MASTER_UI_PORT:-8092}:8080"
+    volumes:
+      # The whole project, so the driver AND the executors see the same paths -
+      # checkpoints included. An executor that cannot see the checkpoint
+      # directory fails the query on the first micro-batch.
+      - ./:/opt/workspace
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/8080' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [ksp-net]
+
+  # ---------------------------------------------------------------------------
+  # SPARK WORKER (phase 8)
+  # Provides the CPU and the RAM, and starts the executors that actually run
+  # the tasks. Deliberately modest: Kafka, its UI and PostgreSQL are already
+  # running on the same machine.
+  # ---------------------------------------------------------------------------
+  spark-worker:
+    image: ksp-spark:3.5.6
+    container_name: ksp-spark-worker
+    hostname: spark-worker
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "${SPARK_WORKER_CORES:-2}"
+      - --memory
+      - "${SPARK_WORKER_MEMORY:-2G}"
+      - --webui-port
+      - "8081"
+    ports:
+      - "${SPARK_WORKER_UI_PORT:-8093}:8081"
+    volumes:
+      - ./:/opt/workspace
+    networks: [ksp-net]
+
+  # ---------------------------------------------------------------------------
+  # SPARK APP (phase 8) - the client, where the DRIVER of the jobs lives.
+  # It does nothing on its own: it stays alive and waits for spark-submit.
+  # ---------------------------------------------------------------------------
+  spark-app:
+    image: ksp-spark:3.5.6
+    container_name: ksp-spark-app
+    hostname: spark-app
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: ["tail", "-f", "/dev/null"]
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      # From inside the docker network it is the INTERNAL listener, never
+      # localhost: "localhost" in a container means the container itself.
+      KAFKA_BOOTSTRAP: kafka:9092
+      PGHOST_OVERRIDE: postgres
+      PGPORT_OVERRIDE: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-streaming_analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-stream_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_local_env}
+    ports:
+      # Spark UI of the APPLICATION: DAG, stages, and above all the
+      # "Structured Streaming" tab (input rate, batch duration, state rows).
+      - "${SPARK_APP_UI_PORT:-4041}:4040"
+    volumes:
+      - ./:/opt/workspace
+    networks: [ksp-net]
+
+# Dedicated network: containers reach each other by their SERVICE NAME
+# (kafka, postgres). That is why the INTERNAL listener advertises "kafka:9092".
+networks:
+  ksp-net:
+    name: ksp-net
+    driver: bridge
+
+# Named volume: the PostgreSQL data survives "docker compose down".
+# It only disappears with "docker compose down -v".
+volumes:
+  ksp-pgdata:
+    name: ksp-pgdata

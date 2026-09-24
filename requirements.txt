@@ -1,0 +1,11 @@
+# Python dependencies of the project.
+# Local install:  python3 -m venv .venv && source .venv/bin/activate
+#                 pip install -r requirements.txt
+#
+# Note: PySpark is NOT here. It will be provided by the Spark image (phase 8),
+# to avoid having two competing versions of Spark on the machine.
+
+confluent-kafka==2.6.1   # official Kafka client (librdkafka): producer + consumer + admin
+python-dotenv==1.0.1     # reads the .env file
+psycopg2-binary==2.9.10  # PostgreSQL driver (consumer -> database, checks)
+pytest==8.3.3            # unit tests (phase 19)
