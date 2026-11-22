@@ -1,0 +1,15 @@
+# Normalise line endings in the repository
+* text=auto eol=lf
+
+# Scripts must keep LF even on Windows checkouts
+*.sh text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.parquet binary
+*.xlsx binary
+
+# Show SQL and notebook diffs nicely
+*.sql diff
+*.ipynb -diff
