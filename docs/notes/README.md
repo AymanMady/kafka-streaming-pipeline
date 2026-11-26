@@ -9,3 +9,4 @@ applying) in this project. Each note is self-contained.
 - [Change data capture](change-data-capture.md) — streaming database changes instead of polling
 - [PostgreSQL indexing](postgres-indexing.md) — when indexes help analytical workloads
 - [Kafka partition keys](kafka-partition-keys.md) — choosing the message key decides ordering and load balance
+- [Backfills](backfills.md) — how to reprocess a historical date range safely
