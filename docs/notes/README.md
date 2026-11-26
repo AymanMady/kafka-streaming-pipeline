@@ -14,3 +14,4 @@ applying) in this project. Each note is self-contained.
 - [Data contracts](data-contracts.md) — agreeing on schema and semantics with producers
 - [Data retention](data-retention.md) — how long each layer keeps data
 - [Retries and backoff](retries-and-backoff.md) — recovering from transient failures
+- [dbt tests](dbt-tests.md) — generic, singular and unit tests and where to put them
