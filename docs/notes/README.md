@@ -13,3 +13,4 @@ applying) in this project. Each note is self-contained.
 - [Testing data pipelines](testing-data-pipelines.md) — unit, integration and data tests
 - [Data contracts](data-contracts.md) — agreeing on schema and semantics with producers
 - [Data retention](data-retention.md) — how long each layer keeps data
+- [Retries and backoff](retries-and-backoff.md) — recovering from transient failures
