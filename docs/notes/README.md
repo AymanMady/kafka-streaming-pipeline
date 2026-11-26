@@ -10,3 +10,4 @@ applying) in this project. Each note is self-contained.
 - [PostgreSQL indexing](postgres-indexing.md) — when indexes help analytical workloads
 - [Kafka partition keys](kafka-partition-keys.md) — choosing the message key decides ordering and load balance
 - [Backfills](backfills.md) — how to reprocess a historical date range safely
+- [Testing data pipelines](testing-data-pipelines.md) — unit, integration and data tests
