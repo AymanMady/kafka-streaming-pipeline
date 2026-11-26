@@ -11,3 +11,4 @@ applying) in this project. Each note is self-contained.
 - [Kafka partition keys](kafka-partition-keys.md) — choosing the message key decides ordering and load balance
 - [Backfills](backfills.md) — how to reprocess a historical date range safely
 - [Testing data pipelines](testing-data-pipelines.md) — unit, integration and data tests
+- [Data contracts](data-contracts.md) — agreeing on schema and semantics with producers
