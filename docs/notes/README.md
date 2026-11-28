@@ -15,3 +15,4 @@ applying) in this project. Each note is self-contained.
 - [Data retention](data-retention.md) — how long each layer keeps data
 - [Retries and backoff](retries-and-backoff.md) — recovering from transient failures
 - [dbt tests](dbt-tests.md) — generic, singular and unit tests and where to put them
+- [Idempotent loads](idempotent-loads.md) — running a load twice must not change the result
